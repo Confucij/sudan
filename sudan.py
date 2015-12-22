@@ -1,56 +1,153 @@
+import getopt
 import json
+import os
 import re
 
-__author__ = 'lordgal'
+import sys
+
+############################ Renderers ######################################
+
+def render_default(fchains):
+
+    conn = []
+    for func, chains in fchains.items():
+        local_conn = []
+        for chain in chains:
+            if not chain:
+                continue
+            stack = chain[0][1]
+            for i in range(0, len(chain) - 1):
+                stack += chain[i+1][1]
+                local_conn.append('"{}:{}" -> "{}:{}" [label={}, style=solid];'.format(
+                    chain[i][0], chain[i][1], chain[i+1][0], chain[i+1][1], stack))
+        local_conn = ['"{}:{}" [style=filled,fillcolor=green];\n'.format(func[0], func[1])] + list(set(local_conn))
+        conn += local_conn
+    return 'digraph callgraph {\nrankdir=LR;\n' + "".join(conn) + "\n}"
 
 
-def build_call_tree(func_tuples, list_of_interest, stack_by_functions):
-    """
-    :type func_dict: dict
-    :type list_of_interest: list
-    :return:
-    """
-    result_tree = {}
-    top_level_functions = {}
 
-    for caller, calle in func_tuples:
-        top_level_functions.setdefault(caller, []).append(calle)
-
-    for function in list_of_interest:
-        result_tree["{}:{}".format(function, stack_by_functions.setdefault(function, 0))] = \
-            traverse_func_list(top_level_functions, function, stack_by_functions)
-
-    return result_tree
-
-def traverse_func_list(functions, function_of_interest, stack_sizes):
-
-    result = {}
-    for func in functions.setdefault(function_of_interest, []):
-        result["{}:{}".format(func, stack_sizes.setdefault(func, -1))] = traverse_func_list(functions, func, stack_sizes)
-    return result
+############################ General Functions ################################
 
 def parse_su_file(path):
     su_file = open(path, 'r')
-    pattern = re.compile(".*:(.*)\s(\d+)\s(static|dynamic)$")
+    pattern = re.compile(".*:(.*)\s(\d+)\s(static|dynamic).*$")
+    stacks = {}
     for line in su_file:
-        pattern.match(line)
+        match = pattern.match(line)
+        if match:
+            stacks[match.group(1)] = int(match.group(2))
+        else:
+            print(line)
+    return stacks
 
+def parse_egypt_call_data(path):
+    su_file = open(path, 'r')
+    pattern = re.compile('"(.+)"\s->\s"(.+)"\s\[style=solid\];')
+    calls = []
+    for line in su_file:
+        match = pattern.match(line)
+        if match:
+            calls.append((match.group(1),match.group(2)))
+    return calls
 
+def build_call_chains(ftuples, depth=10, finterest=None, fstacks=None, fexcept=None):
+    """
+
+    :type ftuples: list
+    :type depth: int
+    :type finterest: list
+    :type fstacks: dict
+    :return: dict
+    """
+
+    if not fstacks:
+        fstacks = {}
+
+    top_functions = {}
+
+    for caller, calle in ftuples:
+        top_functions.setdefault(caller, []).append(calle)
+
+    if not finterest:
+        finterest = [x for x in top_functions.keys()]
+
+    chains = {}
+    for func in finterest:
+        fchain = []
+        chains[(func, fstacks.setdefault(func, 0))] = fchain
+        try:
+            callees = top_functions[func].copy()
+        except KeyError:
+            continue
+
+        cur_depth = depth
+        stack = []
+        chain = [(func, fstacks[func])]
+        while True:
+            try:
+                callee = callees.pop()
+            except IndexError:
+                try:
+                    callees = stack.pop()
+                    chain.pop()
+                    cur_depth += 1
+                except IndexError:
+                    break
+
+            chain.append((callee, fstacks.setdefault(callee, -1)))
+            if callee in fexcept:
+                fchain.append(chain.copy())
+                chain.pop()
+                continue
+
+            if callee in top_functions:
+                if cur_depth:
+                    cur_depth -= 1
+                    stack.append(callees)
+                    callees = top_functions[callee].copy()
+                else:
+                    fchain.append(chain.copy())
+                    chain.pop()
+                    continue
+            else:
+                fchain.append(chain.copy())
+                chain.pop()
+
+    return chains
+
+############################# Main function ##############################################
 
 if __name__ == '__main__':
 
-    func_tuples = [
-        ("chSemSignalWait", "chSchReadyI"),
-        ("chSemSignalWait", "dbg_check_lock"),
-        ("chSemSignalWait", "chSchGoSleepS"),
-        ("chSemSignalWait", "chSchRescheduleS"),
-        ("chSchReadyI", "chDbgCheckClassI"),
-        ("chSchReadyI", "imaginary_func"),
-        ("chDbgCheckClassI", "chDbgPanic"),
-        ("chDbgCheckClassI", "fifo_remove")]
+    options, args = getopt.getopt(sys.argv[1:], "d:f:e:", ["su=", "exp=", "except="])
+    stack_sizes = None
+    calls = []
+    fexcept = []
+    finterest = []
+    depth = 5
 
-    stack = {"chSemSignalWait": 1, "chSchReadyI": 2, "dbg_check_lock": 1, "chSchGoSleepS": 1, "chSchRescheduleS": 1,
-             "chDbgCheckClassI": 1, "imaginary_func": 1, "chDbgPanic": 1, "fifo_remove": 1,}
+    for opt, arg in options:
+        if opt == "--su":
+            stack_sizes = parse_su_file(arg)
+        if opt == "--exp":
+            calls = parse_egypt_call_data(arg)
+        if opt == "--except":
+            fexcept.append(arg)
+        if opt == "-d":
+            depth = int(arg)
+        if opt == "-f":
+            finterest.append(arg)
+        if opt == "-e":
+            fexcept.append(arg)
 
 
-    print(json.dumps(build_call_tree(func_tuples, ["chSemSignalWait"], stack), indent=2, sort_keys=True))
+    if not calls:
+        print("Nothing to do", file=sys.stderr)
+        exit(0)
+    if not stack_sizes:
+        stack_sizes = {}
+
+    chains = build_call_chains(calls, depth, finterest, stack_sizes, fexcept)
+    print(render_default(chains))
+
+    exit(0)
